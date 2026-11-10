@@ -29,6 +29,13 @@ Indian male teacher; it remains available for offline fallback.
   resampling, and merging.
 - Delivery presets apply supported pace/pitch adjustments. They do not claim to
   synthesize emotion or change the source meaning.
+- Verified email accounts use Argon2id password hashes, expiring single-use
+  verification/reset links, TLS-protected SMTP, and a private data directory per
+  account. Registration and email reset require SMTP environment configuration.
+- Audio workspace validates supported audio uploads, previews them without
+  persisting the source, formats manually supplied transcript text, and exports
+  TXT, DOCX, and Unicode Hindi/English PDF. **Automatic speech recognition is not
+  enabled yet**; the transcription provider was deferred.
 
 Text normalization is rule-based, not an LLM: it does not invent explanations.
 Inspect the prepared spoken-text preview before synthesis. No pronunciation
@@ -53,6 +60,40 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 python -m streamlit run app.py
 ```
+
+Account creation requires SMTP settings. In PowerShell, configure these for the
+process before starting Streamlit (use values from your mail provider, not source
+code):
+
+```powershell
+$env:SMTP_HOST = "smtp.example.com"
+$env:SMTP_PORT = "587"
+$env:SMTP_USERNAME = "your-smtp-user"
+$env:SMTP_PASSWORD = "your-smtp-app-password"
+$env:SMTP_FROM_EMAIL = "noreply@example.com"
+$env:AUDIOGEN_BASE_URL = "http://localhost:8501"
+```
+
+For private local development only, account verification can use a localhost
+link instead of email. Keep the Streamlit server bound to `127.0.0.1`; do not
+enable this on Render or any network-accessible deployment:
+
+```powershell
+$env:AUDIOGEN_ENABLE_LOCAL_VERIFICATION = "true"
+$env:AUDIOGEN_BASE_URL = "http://127.0.0.1:8501"
+uv run streamlit run app.py --server.address 127.0.0.1 --server.port 8501
+```
+
+The app displays a one-time verification link in the browser in this mode.
+Without SMTP or this explicit development option, account creation remains
+disabled rather than creating unverified accounts.
+
+Email is sent over TLS. Passwords are hashed with Argon2id and never emailed or
+stored in plaintext. Passwords must contain at least 15 characters; no arbitrary
+uppercase/digit composition rule is imposed. Verification and password-reset
+links are single-use and expire after 30 minutes. Login sessions are per-browser
+session and expire after 12 hours of inactivity. Configure an HTTPS base URL in
+production.
 
 For the optional natural neural voice, install its online provider adapter:
 
@@ -117,11 +158,12 @@ production workloads.
 ## Render deployment
 
 The repository includes a Render Blueprint in [`render.yaml`](./render.yaml).
-Connect the repository to Render and deploy the Blueprint. It configures the
-online neural voice, generated UI password, health check, and persistent audio
-storage. The Blueprint uses a paid Starter service because Render persistent
-disks are not available on the free tier. See [`DEPLOYMENT.md`](./DEPLOYMENT.md)
-for the sign-in and provider limitations.
+Connect the repository to Render and deploy the Blueprint. Configure the
+prompted `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`, and `SMTP_FROM_EMAIL`
+secrets using a verified sender in your mail service. Render provides the public
+service URL for verification links. The Blueprint uses a paid Starter service
+because Render persistent disks are not available on the free tier. See
+[`DEPLOYMENT.md`](./DEPLOYMENT.md) for setup and provider limitations.
 
 ## REST API
 
@@ -164,12 +206,19 @@ limiter, request monitoring, and retention controls. See [DEPLOYMENT.md](./DEPLO
 - `AUDIOGEN_DATA_DIR`: per-user data directory override.
 - `AUDIOGEN_TTS_PROVIDER`: default provider (`local`, `azure`, or `edge`; default `local`).
 - `AUDIOGEN_ESPEAK_PATH`: eSpeak NG executable override.
-- `AUDIOGEN_APP_PASSWORD`: optional password gate for the Streamlit interface;
-  unset for local development. Set a strong secret for a hosted deployment.
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`:
+  TLS SMTP delivery for account verification and password resets.
+- `SMTP_USE_SSL=true`: use implicit TLS (commonly port 465); otherwise STARTTLS
+  is required.
+- `AUDIOGEN_BASE_URL`: public absolute HTTPS URL used in email links (local
+  development may use `http://localhost:8501`).
 - `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION`: optional Azure integration only.
 - `AUDIOGEN_API_KEY`: enables the optional API.
 - `AUDIOGEN_FFMPEG_PATH`: FFmpeg executable override.
 - Default Windows storage: `%LOCALAPPDATA%\AudioGenAI`.
+- Account records are stored in the application data directory. Each verified
+  account's audio, profile, pronunciation, and history database is isolated in
+  its own subdirectory.
 - SQLite stores generation metadata, pronunciation entries, and saved voice
   profiles, but not the original script. Audio files are stored locally until
   deleted from **Library**.
@@ -179,14 +228,14 @@ limiter, request monitoring, and retention controls. See [DEPLOYMENT.md](./DEPLO
 
 ## Tests and performance
 
-Run the deterministic, offline suite:
+Run the deterministic suite:
 
 ```powershell
 uv run pytest
 ```
 
-The suite mocks live provider responses and FFmpeg subprocesses. Passing tests do
-not verify local-engine availability/quality, live provider access, real FFmpeg
+The suite mocks email transport, provider responses, and FFmpeg subprocesses.
+Passing tests do not verify SMTP delivery, live provider access, real FFmpeg
 encoding, or playback on a physical device. See
 [PERFORMANCE.md](./PERFORMANCE.md) for the actual test run and outstanding
 hardware/integration benchmarks.
@@ -238,7 +287,9 @@ does not grant rights to the voice or reference audio.
 app.py                              Streamlit voice studio
 launcher.py                         Optional PyInstaller launcher
 src/audiogen_ai/config.py           Settings and provider voice catalog
+src/audiogen_ai/accounts.py         Verified accounts, Argon2id and SMTP
 src/audiogen_ai/local_tts.py        Local eSpeak NG CPU synthesis
+src/audiogen_ai/transcript_documents.py Audio validation and TXT/DOCX/PDF export
 src/audiogen_ai/azure_tts.py        Authenticated Azure Speech REST client
 src/audiogen_ai/engine.py           Async synthesis, chunking, retry, audio output
 src/audiogen_ai/text_processor.py   Conservative speech-text preparation

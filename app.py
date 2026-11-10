@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
 import logging
 import os
 from collections.abc import Callable
 from dataclasses import replace
+import time
 
 import streamlit as st
 
+from audiogen_ai.accounts import (
+    Account,
+    AccountError,
+    AccountStore,
+    EmailDeliveryError,
+    EmailSettings,
+    local_verification_enabled,
+    local_verification_url,
+    send_account_email,
+)
 from audiogen_ai.audio_processor import merge_audio
 from audiogen_ai.config import Settings, VOICES
 from audiogen_ai.documents import extract_document_text
@@ -19,6 +29,14 @@ from audiogen_ai.engine import SpeechEngine
 from audiogen_ai.language_detector import detect_language
 from audiogen_ai.library import AudioLibrary
 from audiogen_ai.text_processor import prepare_text
+from audiogen_ai.transcript_documents import (
+    MAX_AUDIO_UPLOAD_BYTES,
+    build_docx_document,
+    build_pdf_document,
+    build_text_document,
+    format_transcript,
+    validate_audio_upload,
+)
 from audiogen_ai.validation import sanitize_filename
 from audiogen_ai.voice_calibration import PREVIEW_TEXT, VoiceProfile
 
@@ -60,6 +78,199 @@ st.markdown(
 )
 
 settings = Settings.from_env()
+accounts = AccountStore(settings.data_dir)
+
+
+def render_account_gate() -> Account | None:
+    if "verify" in st.query_params:
+        token = st.query_params.get("verify", "")
+        try:
+            verified = accounts.verify_email(token)
+            st.query_params.clear()
+            if verified:
+                st.success("Email verified. You can now sign in.")
+            else:
+                st.error("This verification link is invalid or expired. Request a new one below.")
+        except (ValueError, OSError):
+            st.query_params.clear()
+            st.error("This verification link could not be used. Request a new one below.")
+
+    account_id = st.session_state.get("_account_id")
+    now = time.time()
+    last_seen = st.session_state.get("_account_last_seen", now)
+    if account_id and now - last_seen > 12 * 60 * 60:
+        st.session_state.pop("_account_id", None)
+        st.session_state.pop("_account_last_seen", None)
+        st.info("Your session expired. Please sign in again.")
+        account_id = None
+    if account_id:
+        account = accounts.get_account(account_id)
+        if account:
+            st.session_state["_account_last_seen"] = now
+            return account
+        st.session_state.pop("_account_id", None)
+        st.session_state.pop("_account_last_seen", None)
+
+    st.markdown(
+        '<div class="hero"><span class="eyebrow">Private voice workspace</span>'
+        "<h1>AUDIOGEN AI</h1><p>Create an account or sign in to continue.</p></div>",
+        unsafe_allow_html=True,
+    )
+    try:
+        email_delivery = EmailSettings.from_env()
+        email_configuration_error = None
+    except EmailDeliveryError as exc:
+        email_delivery = None
+        email_configuration_error = str(exc)
+    local_verification = False
+    if email_configuration_error:
+        st.warning(email_configuration_error)
+    elif email_delivery is None:
+        try:
+            local_verification = local_verification_enabled()
+        except EmailDeliveryError as exc:
+            st.error(str(exc))
+        if local_verification:
+            st.warning(
+                "Local development verification is enabled. Verification links are displayed "
+                "in this browser and must only be used on a private localhost server."
+            )
+        else:
+            st.info(
+                "Email verification is not configured. Configure SMTP for account creation, "
+                "or enable the localhost-only development option in the README."
+            )
+    reset_token = st.query_params.get("reset", "")
+    if reset_token:
+        with st.form("reset-password-form"):
+            new_password = st.text_input("New password", type="password")
+            confirm_password = st.text_input("Confirm new password", type="password")
+            reset = st.form_submit_button("Set new password", type="primary")
+        if reset:
+            if new_password != confirm_password:
+                st.error("The passwords do not match.")
+            else:
+                try:
+                    changed = accounts.reset_password(reset_token, new_password)
+                    st.query_params.clear()
+                    if changed:
+                        st.success("Password updated. Sign in with your new password.")
+                    else:
+                        st.error("This password-reset link is invalid or expired.")
+                except ValueError as exc:
+                    st.error(str(exc))
+        return None
+
+    login_tab, register_tab, verify_tab, reset_tab = st.tabs(
+        ["Sign in", "Create account", "Verify email", "Forgot password"]
+    )
+    with login_tab:
+        with st.form("login-form"):
+            email = st.text_input("Email", key="login-email")
+            password = st.text_input("Password", type="password", key="login-password")
+            submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+        if submitted:
+            try:
+                account = accounts.authenticate(email, password)
+                if account:
+                    st.session_state["_account_id"] = account.id
+                    st.session_state["_account_last_seen"] = time.time()
+                    st.rerun()
+                st.error(
+                    "Sign-in failed. Check your email and password, and verify your email address."
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+
+    with register_tab:
+        st.caption(
+            "Use a unique passphrase of at least 15 characters. Letters, spaces, and symbols "
+            "are accepted; predictable common passwords are rejected."
+        )
+        with st.form("register-form"):
+            name = st.text_input("Display name", max_chars=80, key="register-name")
+            email = st.text_input("Email address", key="register-email")
+            password = st.text_input("Password", type="password", key="register-password")
+            confirm = st.text_input("Confirm password", type="password", key="register-confirm")
+            submitted = st.form_submit_button(
+                "Create account",
+                type="primary",
+                use_container_width=True,
+                disabled=email_delivery is None and not local_verification,
+            )
+        if submitted:
+            try:
+                delivery = email_delivery
+                if delivery is None:
+                    if not local_verification:
+                        raise EmailDeliveryError(
+                            "Account email is not configured. The administrator must configure SMTP."
+                        )
+                if password != confirm:
+                    raise AccountError("The passwords do not match.")
+                account, token = accounts.register(name, email, password)
+                if delivery is not None:
+                    send_account_email(account, token, "verify", delivery)
+                    st.success(
+                        "If the address can be registered, a verification link has been sent. "
+                        "The link expires in 30 minutes."
+                    )
+                else:
+                    st.success("Account created. Use this localhost link to verify your email:")
+                    st.link_button(
+                        "Verify email address",
+                        local_verification_url(token),
+                        use_container_width=True,
+                    )
+            except (ValueError, EmailDeliveryError) as exc:
+                st.error(str(exc))
+
+    with verify_tab:
+        st.caption(
+            "Request a fresh verification link. For privacy, the response does not reveal "
+            "whether the account exists."
+        )
+        with st.form("resend-verification-form"):
+            email = st.text_input("Email address", key="resend-email")
+            submitted = st.form_submit_button("Send verification link")
+        if submitted:
+            try:
+                delivery = email_delivery
+                if delivery is None:
+                    raise EmailDeliveryError(
+                        "Account email is not configured. Contact the administrator."
+                    )
+                result = accounts.request_token(email, "verify")
+                if result:
+                    send_account_email(result[0], result[1], "verify", delivery)
+                st.success("If the account needs verification, an email will be sent.")
+            except (ValueError, EmailDeliveryError) as exc:
+                st.error(str(exc))
+
+    with reset_tab:
+        st.caption("If the email belongs to a verified account, a single-use reset link will be sent.")
+        with st.form("request-reset-form"):
+            email = st.text_input("Email address", key="reset-email")
+            submitted = st.form_submit_button("Send password-reset link")
+        if submitted:
+            try:
+                delivery = email_delivery
+                if delivery is None:
+                    raise EmailDeliveryError("Account email is not configured. Contact the administrator.")
+                result = accounts.request_token(email, "reset")
+                if result:
+                    send_account_email(result[0], result[1], "reset", delivery)
+                st.success("If the verified account exists, a password-reset email will be sent.")
+            except (ValueError, EmailDeliveryError) as exc:
+                st.error(str(exc))
+    return None
+
+
+account = render_account_gate()
+if account is None:
+    st.stop()
+
+settings = replace(settings, data_dir=accounts.workspace(account))
 library = AudioLibrary(settings.data_dir)
 engine = SpeechEngine(settings)
 
@@ -89,24 +300,6 @@ elif settings.default_provider == "edge":
 for key, value in _PROFILE_WIDGETS.items():
     st.session_state.setdefault(key, value)
 st.session_state.setdefault("_provider_seen", st.session_state["provider"])
-
-app_password = os.environ.get("AUDIOGEN_APP_PASSWORD")
-if app_password and not st.session_state.get("_authenticated", False):
-    st.markdown(
-        '<div class="hero"><span class="eyebrow">Private voice workspace</span>'
-        "<h1>AUDIOGEN AI</h1><p>Sign in to open your voice studio.</p></div>",
-        unsafe_allow_html=True,
-    )
-    with st.form("app-login"):
-        entered_password = st.text_input("Access password", type="password")
-        login = st.form_submit_button("Sign in", type="primary", use_container_width=True)
-    if login:
-        if hmac.compare_digest(entered_password, app_password):
-            st.session_state["_authenticated"] = True
-            st.rerun()
-        st.error("Incorrect access password.")
-    st.stop()
-
 
 def current_profile() -> VoiceProfile:
     return VoiceProfile(
@@ -459,6 +652,11 @@ st.sidebar.markdown(
     "</div>",
     unsafe_allow_html=True,
 )
+st.sidebar.text(f"Signed in: {account.name}\n{account.email}")
+if st.sidebar.button("Sign out", use_container_width=True):
+    for session_key in list(st.session_state.keys()):
+        del st.session_state[session_key]
+    st.rerun()
 if profile_rows:
     selected_profile = st.sidebar.selectbox("Saved voice profiles", ["Current settings", *profile_rows])
     if selected_profile != "Current settings" and st.sidebar.button("Load profile"):
@@ -466,7 +664,14 @@ if profile_rows:
         st.rerun()
 page = st.sidebar.radio(
     "Workspace",
-    ["Voice Studio", "Voice Calibration", "Pronunciation Dictionary", "Library", "Settings"],
+    [
+        "Voice Studio",
+        "Audio to Text",
+        "Voice Calibration",
+        "Pronunciation Dictionary",
+        "Library",
+        "Settings",
+    ],
     label_visibility="collapsed",
 )
 
@@ -558,6 +763,119 @@ if page == "Voice Studio":
         except Exception as exc:
             logging.exception("Speech generation failed")
             st.error(f"Speech generation failed. Check your connection/provider settings and retry: {exc}")
+
+elif page == "Audio to Text":
+    st.markdown(
+        '<div class="hero"><span class="eyebrow">TRANSCRIPT WORKSPACE</span>'
+        "<h1>Turn recordings into readable documents.</h1>"
+        "<p>Prepare, format, and export an audio transcript in a clean sequence.</p></div>",
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "Automatic speech recognition is not enabled yet; its provider was deferred. "
+        "You can upload and preview audio, then paste or type the transcript for formatting "
+        "and export. No audio is sent to a transcription service or saved by this page."
+    )
+    audio_upload = st.file_uploader(
+        "Upload audio",
+        type=["wav", "mp3", "m4a", "mp4", "flac", "ogg", "opus", "webm"],
+        max_upload_size=MAX_AUDIO_UPLOAD_BYTES // (1024 * 1024),
+        key="transcript-audio",
+    )
+    upload_info = None
+    if audio_upload is not None:
+        try:
+            audio_bytes = audio_upload.getvalue()
+            upload_info = validate_audio_upload(audio_upload.name, audio_bytes)
+            st.caption(
+                f"{upload_info.filename} · {upload_info.format} · "
+                f"{upload_info.size_bytes / (1024 * 1024):.2f} MB"
+            )
+            st.audio(audio_bytes)
+        except ValueError as exc:
+            st.error(str(exc))
+
+    doc_title = st.text_input(
+        "Document title",
+        value=os.path.splitext(upload_info.filename)[0] if upload_info else "Audio transcript",
+        max_chars=120,
+    )
+    transcript_text = st.text_area(
+        "Transcript text",
+        key="transcript-body",
+        height=300,
+        max_chars=settings.max_text_chars,
+        placeholder="Paste or type the transcript here. Automatic transcription will be available after an ASR provider is configured.",
+    )
+    numbered_paragraphs = st.checkbox(
+        "Number paragraphs in reading order",
+        help="Adds paragraph numbers without rewriting or reordering your words.",
+    )
+    formatted = ""
+    if transcript_text.strip():
+        try:
+            formatted = format_transcript(
+                transcript_text, numbered_paragraphs=numbered_paragraphs
+            )
+            with st.expander("Formatted document preview", expanded=True):
+                st.text(formatted)
+        except ValueError as exc:
+            st.error(str(exc))
+
+    export_signature = (
+        hashlib.sha256(f"{upload_info.filename}\0{doc_title}\0{formatted}".encode("utf-8")).hexdigest()
+        if upload_info and formatted
+        else None
+    )
+    saved_exports = st.session_state.get("transcript_exports")
+    if saved_exports and saved_exports["signature"] != export_signature:
+        st.session_state.pop("transcript_exports", None)
+        saved_exports = None
+    if st.button(
+        "Prepare TXT, DOCX and PDF downloads",
+        type="primary",
+        disabled=not (upload_info and formatted),
+    ):
+        try:
+            with st.spinner("Formatting accessible transcript documents…"):
+                base_name = sanitize_filename(doc_title) or "audio-transcript"
+                st.session_state["transcript_exports"] = {
+                    "signature": export_signature,
+                    "filename": base_name,
+                    "txt": build_text_document(doc_title, formatted, upload_info.filename),
+                    "docx": build_docx_document(doc_title, formatted, upload_info.filename),
+                    "pdf": build_pdf_document(doc_title, formatted, upload_info.filename),
+                }
+            saved_exports = st.session_state["transcript_exports"]
+        except Exception as exc:
+            logging.error("Transcript document export failed (%s)", type(exc).__name__)
+            st.error(
+                "Could not prepare the documents. Check the title and transcript, "
+                f"then retry. Error type: {type(exc).__name__}."
+            )
+    if saved_exports and saved_exports["signature"] == export_signature:
+        text_column, word_column, pdf_column = st.columns(3)
+        text_column.download_button(
+            "Download TXT",
+            saved_exports["txt"],
+            file_name=f"{saved_exports['filename']}.txt",
+            mime="text/plain; charset=utf-8",
+            use_container_width=True,
+        )
+        word_column.download_button(
+            "Download DOCX",
+            saved_exports["docx"],
+            file_name=f"{saved_exports['filename']}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+        pdf_column.download_button(
+            "Download PDF",
+            saved_exports["pdf"],
+            file_name=f"{saved_exports['filename']}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
 elif page == "Voice Calibration":
     st.title("Voice calibration studio")
@@ -750,7 +1068,11 @@ else:
     st.write(f"Local eSpeak NG available: **{'Yes' if engine.local_available else 'No'}**")
     st.write(f"Online neural voice package available: **{'Yes' if engine.edge_available else 'No'}**")
     st.write(f"FFmpeg available: **{'Yes' if engine.ffmpeg_available else 'No'}**")
-    st.write(f"Password protection enabled: **{'Yes' if app_password else 'No'}**")
+    try:
+        email_configured = EmailSettings.from_env() is not None
+    except EmailDeliveryError:
+        email_configured = False
+    st.write(f"Email delivery configured: **{'Yes' if email_configured else 'No'}**")
     st.caption(
         "Online neural synthesis sends the selected text to the provider. Check its current "
         "privacy and voice-use terms before using sensitive or commercial content."

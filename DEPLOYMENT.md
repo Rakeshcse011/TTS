@@ -4,27 +4,39 @@
 
 1. Push this repository to a Git provider and create a Render Blueprint from it.
    Render will read [`render.yaml`](./render.yaml).
-2. The Blueprint provisions a Starter web service, a 1 GB persistent disk, and a
-   generated `AUDIOGEN_APP_PASSWORD`. Review the plan and disk cost in Render
-   before confirming; persistent disks are not available on the free web-service
-   tier.
-3. After the first deploy, open the service's **Environment** page and copy the
-   generated `AUDIOGEN_APP_PASSWORD` from the secret value. Open the service URL
-   and sign in. The value is not printed in application logs.
-4. The Render configuration selects the online neural Edge voice so lessons
+2. The Blueprint provisions a Starter web service and a 1 GB persistent disk.
+   Review the plan and disk cost in Render before confirming; persistent disks
+   are not available on the free web-service tier.
+3. Configure `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`, and
+   `SMTP_FROM_EMAIL` in the Render Environment page using a verified sender and
+   app-specific SMTP credentials. Keep secrets in Render's environment manager,
+   never in the repository. Use SMTP port 587 with STARTTLS or set
+   `SMTP_USE_SSL=true` for a provider requiring implicit TLS.
+4. Open the service URL, create an account, and use the verification link from
+   the email. Accounts cannot sign in until the address is verified.
+5. Password reset is also sent by email. Passwords are Argon2id-hashed;
+   verification/reset links are single-use and expire after 30 minutes. Login is
+   limited to the browser session and expires after 12 hours of inactivity.
+6. The Render configuration selects the online neural Edge voice so lessons
    sound more natural than the local eSpeak NG fallback. Synthesis needs outbound
    internet; text is sent to the speech provider. Edge TTS is an unofficial
    integration, may be rate-limited or changed by its operator, and is not a
    service-level or commercial-use guarantee. For a commercial production
    workload, use a provider contract that explicitly permits your usage.
-5. Uploaded/generated audio and saved profiles use `/var/data`. The deployment
-   health check is `/_stcore/health`. Keep the generated access password private
-   and rotate it in Render if it is exposed.
+7. Audio and saved profiles use `/var/data`. The deployment
+   health check is `/_stcore/health`. Keep SMTP credentials private and rotate
+   them if they are exposed. Account data is stored in
+   separate per-account directories on the persistent disk.
 
-The password gate protects the Streamlit interface when
-`AUDIOGEN_APP_PASSWORD` is set. Render's generated value enables it by default;
-if the variable is omitted in another hosting environment, the UI has no login.
-The optional FastAPI service is not started by this Blueprint.
+Without working SMTP settings, account registration and email-based password
+recovery cannot complete. The optional FastAPI service is not started by this
+Blueprint. Configure TLS at the hosting/reverse-proxy boundary for any
+non-Render deployment.
+
+The **Audio to Text** workspace validates and previews uploads and exports
+user-entered transcript text as TXT, DOCX, and PDF. Automatic speech recognition
+is deliberately not enabled until a provider is selected; the current workspace
+does not upload audio to a transcription API.
 
 ## Local production-like Windows setup
 
